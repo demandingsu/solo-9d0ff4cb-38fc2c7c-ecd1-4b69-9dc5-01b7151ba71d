@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -49,6 +49,28 @@ _MAX_YEAR = 2100
 # 标题里用于判定公告类型的关键词
 _CORRECTION_KEYWORDS = ("更正", "澄清", "变更", "修改", "延期", "答疑", "补充公告")
 _CANCELLATION_KEYWORDS = ("取消", "终止", "废标", "撤项")
+
+# 排期目录页字段标签
+_BATCH_LABELS = ("发布批次", "数据批次", "批次编号", "批次")
+# 排期详情页字段标签
+_SESSION_BATCH_LABELS = ("发布批次", "数据批次", "批次编号", "批次")
+_NOTICE_NO_LABELS = ("公告编号", "公告编码", "公告号")
+_SESSION_NO_LABELS = ("场次编号", "场次编码", "开标场次", "场次号")
+_ROOM_LABELS = ("会议室", "开标室", "开标场地", "评审室", "场地名称")
+_START_LABELS = ("开标开始时间", "开始时间", "开标时间", "场次开始时间")
+_END_LABELS = ("开标结束时间", "结束时间", "场次结束时间")
+_RESCHEDULE_LABELS = ("改期引用", "替代公告", "原公告编号", "替换场次", "更正引用")
+
+# 带偏移量的时区片段，如 +08:00 / -05:30 / +0800 / UTC+8 / GMT+08:00；
+# 负向回顾避免把日期 2026-11-20 中的 “-11” 误判为时区偏移
+_TZ_OFFSET_RE = re.compile(
+    r"(?<![\d-])(?:UTC|GMT)?\s*([+-])(\d{1,2})(?::(\d{2}))?(?!\d)"
+)
+_TZ_NAME_RE = re.compile(r"\b(?:UTC|GMT|Z)\b")
+# 分页链接关键词（出现在 href 或链接文本中即视为分页导航）
+_PAGE_HINT_RE = re.compile(r"(?:^|[/?&=-])(?:page|p)(?:[/=.-]|$)|下一页|下一頁|下页", re.I)
+# 目录分页/导航类链接，不应当作场次详情
+_NAV_SKIP_PATH = re.compile(r"(login|logout|register|index|home|about|contact|search|#|javascript)", re.I)
 
 
 class ParseError(ValueError):
@@ -92,6 +114,75 @@ def parse_datetime(text: str | None) -> datetime | None:
         year, month, day = (int(g) for g in match.groups())
         return datetime(year, month, day)
     return None
+
+
+def _extract_tzinfo(text: str) -> timezone | None:
+    """从文本尾部提取显式时区：``Z``/``UTC``/``GMT`` 或 ``UTC+08:00`` 等偏移量。"""
+    if not text:
+        return None
+    if re.search(r"(?:Z|UTC|GMT)\s*$", text.strip()):
+        return timezone.utc
+    match = _TZ_OFFSET_RE.search(text)
+    if not match:
+        return None
+    sign, hours, minutes = match.groups()
+    offset = timedelta(hours=int(hours), minutes=int(minutes or 0))
+    return timezone(offset if sign == "+" else -offset)
+
+
+def parse_datetime_tz(text: str | None) -> datetime | None:
+    """解析**带时区**的日期时间；无法识别时区时返回 ``None``（绝不退化为无时区时间）。
+
+    支持：
+    * ISO 8601：``2026-11-20T09:00:00+08:00``、``2026-11-20T01:00:00Z``；
+    * 中文/普通写法带时区：``2026年11月20日 9时00分 UTC+08:00``、``... GMT-05:00``。
+    """
+    if not text:
+        return None
+    raw = text.strip()
+
+    # 1) 标准 ISO 8601（含 Z 或偏移量）；允许其后再跟空白/时区名等文本
+    iso = re.match(
+        r"^\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)\s*"
+        r"(?:([Zz])(?=\s|$)|([+-]\d{2}:?\d{2})(?=\s|$|[A-Za-z]))",
+        raw,
+    )
+    if iso:
+        z_token, offset_token = iso.group(3), iso.group(4)
+        try:
+            if z_token:
+                tzinfo: timezone | None = timezone.utc
+            else:
+                token = offset_token if ":" in offset_token else f"{offset_token[:3]}:{offset_token[3:]}"
+                tzinfo = timezone(
+                    timedelta(
+                        hours=int(token[1:3]),
+                        minutes=int(token[4:6]),
+                    )
+                    * (1 if token[0] == "+" else -1)
+                )
+            date_part, time_part = iso.group(1), iso.group(2)
+            hour, minute, second = (time_part.split(":") + ["0", "0"])[:3]
+            return datetime(
+                *(int(x) for x in date_part.split("-")),
+                int(hour),
+                int(minute),
+                int(second),
+                tzinfo=tzinfo,
+            )
+        except (ValueError, OverflowError):
+            return None
+
+    # 2) 中文/普通写法 + 显式时区名/偏移量
+    if not _TZ_NAME_RE.search(raw):
+        return None
+    naive = parse_datetime(raw)
+    if naive is None:
+        return None
+    tzinfo = _extract_tzinfo(raw)
+    if tzinfo is None:
+        return None
+    return naive.replace(tzinfo=tzinfo)
 
 
 def same_site(url: str, base_url: str) -> bool:
@@ -302,4 +393,161 @@ def parse_detail(html: str, url: str) -> DetailData:
         cancellation_reason=reason,
         kind_hint=kind_hint,
         warnings=warnings,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 排期目录页 / 场次详情页
+# --------------------------------------------------------------------------- #
+@dataclass
+class SessionDetailData:
+    """开标场次详情页解析结果（全部时间均为带时区时间）。"""
+
+    title: str
+    notice_no: str
+    session_no: str
+    project_code: str
+    meeting_room: str
+    starts_at: datetime
+    ends_at: datetime
+    batch: str
+    supersedes: str | None = None
+
+
+def _non_empty(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = _clean(value)
+    return value or None if value not in ("无", "None", "none", "-", "--") else None
+
+
+def extract_catalog_batch(html: str) -> str | None:
+    """读取目录页声明的发布批次：``data-field`` 标记优先，其次标签匹配。"""
+    soup = _soup(html)
+    return _non_empty(_data_field(soup, "batch") or _labeled_value(soup, _BATCH_LABELS))
+
+
+def extract_next_page(html: str, current_url: str) -> str | None:
+    """发现目录页的“下一页”同站链接；没有下一页时返回 ``None``。
+
+    优先识别显式 ``rel="next"``，其次按链接文本/href 中的分页关键词匹配，
+    只返回同站点绝对 URL。
+    """
+    soup = _soup(html)
+    candidates: list[str] = []
+
+    rel_next = soup.find(attrs={"rel": "next"})
+    if rel_next is not None and rel_next.get("href"):
+        candidates.append(rel_next["href"].strip())
+
+    for anchor in soup.find_all("a", href=True):
+        text = _clean(anchor.get_text())
+        href = anchor["href"].strip()
+        if "下一页" in text or "下一頁" in text or "下页" in text or _PAGE_HINT_RE.search(href):
+            candidates.append(href)
+
+    for href in candidates:
+        absolute = urljoin(current_url, href)
+        if absolute.startswith(("http://", "https://")) and same_site(absolute, current_url):
+            return absolute
+    return None
+
+
+def extract_session_links(html: str, catalog_url: str) -> list[tuple[str, str, str]]:
+    """提取目录页中指向同站点场次详情页的链接（排除分页与导航链接）。
+
+    返回 ``(绝对URL, 链接文本, 行上下文)`` 去重列表，保持页面出现顺序。
+    """
+    soup = _soup(html)
+    seen: set[str] = set()
+    links: list[tuple[str, str, str]] = []
+    current_path = urlparse(catalog_url).path.rstrip("/")
+
+    for anchor in soup.find_all("a", href=True):
+        href = anchor["href"].strip()
+        text = _clean(anchor.get_text())
+        # 分页导航不是场次详情（下一页/上一页、href 中带 page/p 分页参数）
+        if (
+            "下一页" in text
+            or "下一頁" in text
+            or "下页" in text
+            or "上一页" in text
+            or "上一頁" in text
+            or _PAGE_HINT_RE.search(href)
+        ):
+            continue
+        absolute = urljoin(catalog_url, href)
+        if not absolute.startswith(("http://", "https://")):
+            continue
+        if not same_site(absolute, catalog_url):
+            continue
+        parsed = urlparse(absolute)
+        if _NAV_SKIP_PATH.search(parsed.path) or parsed.path.rstrip("/") == current_path:
+            continue
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+        row = anchor.find_parent(["tr", "li", "dd", "article"]) or anchor.parent
+        context = _clean(row.get_text(" ")) if row is not None else ""
+        links.append((absolute, text, context))
+    return links
+
+
+def parse_session_detail(html: str, url: str) -> SessionDetailData:
+    """解析开标场次详情页，提取排期核查所需字段。
+
+    起止时间必须能解析为**带时区**时间；任一必填字段缺失即抛 ``ParseError``，
+    由编排层按抓取失败处理，避免用不完整场次参与交叠判定。
+    """
+    soup = _soup(html)
+
+    title_node = soup.find("title")
+    h1 = soup.find("h1")
+    title = _clean(h1.get_text() if h1 else (title_node.get_text() if title_node else ""))
+    if not title:
+        raise ParseError(f"场次详情页缺少标题：{url}")
+
+    def field_value(name: str, labels: tuple[str, ...]) -> str | None:
+        return _non_empty(_data_field(soup, name) or _labeled_value(soup, labels))
+
+    notice_no = field_value("notice-no", _NOTICE_NO_LABELS)
+    session_no = field_value("session-no", _SESSION_NO_LABELS)
+    project_code = field_value("project-code", _PROJECT_LABELS)
+    meeting_room = field_value("meeting-room", _ROOM_LABELS)
+    batch = field_value("batch", _SESSION_BATCH_LABELS)
+    supersedes = field_value("supersedes", _RESCHEDULE_LABELS)
+
+    starts_raw = field_value("starts-at", _START_LABELS)
+    ends_raw = field_value("ends-at", _END_LABELS)
+    starts_at = parse_datetime_tz(starts_raw)
+    ends_at = parse_datetime_tz(ends_raw)
+
+    missing = [
+        name
+        for name, value in (
+            ("公告编号", notice_no),
+            ("场次编号", session_no),
+            ("项目编号", project_code),
+            ("会议室", meeting_room),
+            ("发布批次", batch),
+            ("开标开始时间", starts_at),
+            ("开标结束时间", ends_at),
+        )
+        if value is None or value == ""
+    ]
+    if missing:
+        raise ParseError(f"场次详情页缺少必填字段（{ '、'.join(missing) }）：{url}")
+    if ends_at <= starts_at:
+        raise ParseError(f"场次结束时间不晚于开始时间：{url}")
+
+    return SessionDetailData(
+        title=title,
+        notice_no=notice_no,  # type: ignore[arg-type]
+        session_no=session_no,  # type: ignore[arg-type]
+        project_code=project_code,  # type: ignore[arg-type]
+        meeting_room=meeting_room,  # type: ignore[arg-type]
+        starts_at=starts_at,  # type: ignore[arg-type]
+        ends_at=ends_at,  # type: ignore[arg-type]
+        batch=batch,  # type: ignore[arg-type]
+        supersedes=supersedes,
     )
